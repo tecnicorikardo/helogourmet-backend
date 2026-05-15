@@ -74,14 +74,86 @@ app.post('/criar-pagamento', async (req, res) => {
     });
 
     res.json({
-      init_point: resultado.init_point,       // URL de pagamento (produção)
-      sandbox_init_point: resultado.sandbox_init_point, // URL de teste
+      init_point: resultado.init_point,
+      sandbox_init_point: resultado.sandbox_init_point,
       pedidoId
     });
 
   } catch (err) {
     console.error('Erro ao criar pagamento:', err);
     res.status(500).json({ erro: 'Erro ao criar pagamento.' });
+  }
+});
+
+// ── Gerar QR Code Pix (sem necessidade de conta MP do pagador)
+app.post('/criar-pix', async (req, res) => {
+  try {
+    const { itens, total, nomeCliente, emailCliente, cpfCliente } = req.body;
+    if (!itens || itens.length === 0) {
+      return res.status(400).json({ erro: 'Carrinho vazio.' });
+    }
+
+    // Salva pedido no Firestore
+    let pedidoId = null;
+    if (db) {
+      const ref = await db.collection('pedidos').add({
+        itens,
+        total,
+        status: 'pendente',
+        tipoPagamento: 'pix',
+        criadoEm: Timestamp.now()
+      });
+      pedidoId = ref.id;
+    }
+
+    // Descrição resumida dos itens
+    const descricao = itens.map(i => `${i.quantidade}x ${i.nome}`).join(', ').slice(0, 200);
+
+    // Cria pagamento Pix direto
+    const payment = new Payment(mp);
+    const resultado = await payment.create({
+      body: {
+        transaction_amount: Number(total),
+        description: descricao || 'Pedido Hélo Gourmet',
+        payment_method_id: 'pix',
+        payer: {
+          email: emailCliente || 'cliente@helogourmet.com.br',
+          first_name: nomeCliente || 'Cliente',
+          identification: cpfCliente
+            ? { type: 'CPF', number: cpfCliente.replace(/\D/g, '') }
+            : undefined
+        },
+        notification_url: `${process.env.BACKEND_URL || 'https://helogourmet-backend.onrender.com'}/webhook`,
+        external_reference: pedidoId || 'sem-id',
+        statement_descriptor: 'HELO GOURMET'
+      }
+    });
+
+    const pixData = resultado.point_of_interaction?.transaction_data;
+
+    res.json({
+      pedidoId,
+      pagamentoId: resultado.id,
+      qrCode: pixData?.qr_code,           // código copia-e-cola
+      qrCodeBase64: pixData?.qr_code_base64, // imagem do QR Code
+      status: resultado.status,
+      expiracao: resultado.date_of_expiration
+    });
+
+  } catch (err) {
+    console.error('Erro ao gerar Pix:', err);
+    res.status(500).json({ erro: 'Erro ao gerar Pix. Verifique o Access Token.' });
+  }
+});
+
+// ── Verificar status de um pagamento Pix
+app.get('/status-pix/:pagamentoId', async (req, res) => {
+  try {
+    const payment = new Payment(mp);
+    const resultado = await payment.get({ id: req.params.pagamentoId });
+    res.json({ status: resultado.status, statusDetalhe: resultado.status_detail });
+  } catch (err) {
+    res.status(500).json({ erro: 'Erro ao verificar status.' });
   }
 });
 

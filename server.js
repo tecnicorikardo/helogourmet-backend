@@ -141,8 +141,9 @@ app.post('/criar-pix', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('Erro ao gerar Pix:', err);
-    res.status(500).json({ erro: 'Erro ao gerar Pix. Verifique o Access Token.' });
+    console.error('Erro ao gerar Pix:', err?.message || err);
+    const detalhe = err?.cause?.message || err?.message || 'Erro desconhecido';
+    res.status(500).json({ erro: `Erro ao gerar Pix: ${detalhe}` });
   }
 });
 

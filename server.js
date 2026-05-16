@@ -12,10 +12,10 @@ const app = express();
 app.use(cors({ origin: '*' })); // Restrinja ao domínio do seu site em produção
 app.use(express.json());
 
-// ── Mercado Pago — coloque seu Access Token aqui ou em variável de ambiente
-const mp = new MercadoPagoConfig({
-  accessToken: process.env.MP_ACCESS_TOKEN || 'SEU_ACCESS_TOKEN_AQUI'
-});
+// ── Mercado Pago
+const mpToken = process.env.MP_ACCESS_TOKEN || '';
+console.log(`MP Token configurado: ${mpToken ? mpToken.slice(0,20) + '...' : 'NÃO CONFIGURADO'}`);
+const mp = new MercadoPagoConfig({ accessToken: mpToken });
 
 // ── Firebase Admin — use variável de ambiente com o JSON da service account
 let db;
@@ -160,7 +160,32 @@ app.get('/status-pix/:pagamentoId', async (req, res) => {
 
 // ── Webhook — Mercado Pago notifica aqui quando pagamento é confirmado
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // Responde imediatamente para o MP não reenviar
+  // Valida assinatura se a chave secreta estiver configurada
+  const secret = process.env.MP_WEBHOOK_SECRET;
+  if (secret) {
+    const xSignature = req.headers['x-signature'];
+    const xRequestId = req.headers['x-request-id'];
+    const dataId = req.query['data.id'] || req.body?.data?.id;
+
+    if (xSignature) {
+      const crypto = require('crypto');
+      const parts = xSignature.split(',');
+      let ts = '', v1 = '';
+      parts.forEach(p => {
+        const [k, v] = p.trim().split('=');
+        if (k === 'ts') ts = v;
+        if (k === 'v1') v1 = v;
+      });
+      const manifest = `id:${dataId};request-id:${xRequestId};ts:${ts};`;
+      const hmac = crypto.createHmac('sha256', secret).update(manifest).digest('hex');
+      if (hmac !== v1) {
+        console.warn('Webhook: assinatura inválida');
+        return res.sendStatus(401);
+      }
+    }
+  }
+
+  res.sendStatus(200); // Responde imediatamente
 
   const { type, data } = req.body;
   if (type !== 'payment' || !data?.id) return;

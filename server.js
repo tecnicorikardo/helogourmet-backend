@@ -1,23 +1,19 @@
 // ============================================================
-// BACKEND — Webhook Mercado Pago + Criar Preferência de Pagamento
-// Deploy no Render.com (free tier, sem cartão)
+// BACKEND — Pix via Efí Bank + Webhook
+// Deploy no Render.com
 // ============================================================
 const express = require('express');
 const cors = require('cors');
-const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
+const https = require('https');
+const fs = require('fs');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore, Timestamp } = require('firebase-admin/firestore');
 
 const app = express();
-app.use(cors({ origin: '*' })); // Restrinja ao domínio do seu site em produção
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── Mercado Pago
-const mpToken = process.env.MP_ACCESS_TOKEN || '';
-console.log(`MP Token configurado: ${mpToken ? mpToken.slice(0,20) + '...' : 'NÃO CONFIGURADO'}`);
-const mp = new MercadoPagoConfig({ accessToken: mpToken });
-
-// ── Firebase Admin — use variável de ambiente com o JSON da service account
+// ── Firebase Admin
 let db;
 try {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -28,77 +24,137 @@ try {
   console.warn('Firebase Admin não configurado:', e.message);
 }
 
-// ── Rota de saúde
-app.get('/', (req, res) => res.json({ status: 'ok', servico: 'Hélo Gourmet Backend' }));
+// ── Efí Bank config
+const EFI_CLIENT_ID     = process.env.EFI_CLIENT_ID     || '';
+const EFI_CLIENT_SECRET = process.env.EFI_CLIENT_SECRET || '';
+const EFI_SANDBOX       = process.env.EFI_SANDBOX === 'true'; // false em produção
+const EFI_BASE_URL      = EFI_SANDBOX
+  ? 'https://pix-h.api.efipay.com.br'
+  : 'https://pix.api.efipay.com.br';
 
-// ── Criar preferência de pagamento (chamado pelo site do cliente)
-app.post('/criar-pagamento', async (req, res) => {
+console.log(`Efí Bank: ${EFI_SANDBOX ? 'SANDBOX' : 'PRODUÇÃO'}`);
+console.log(`Client ID configurado: ${EFI_CLIENT_ID ? EFI_CLIENT_ID.slice(0,12) + '...' : 'NÃO CONFIGURADO'}`);
+
+// ── Obtém token de acesso da Efí Bank
+async function getEfiToken() {
+  return new Promise((resolve, reject) => {
+    const credentials = Buffer.from(`${EFI_CLIENT_ID}:${EFI_CLIENT_SECRET}`).toString('base64');
+    const body = 'grant_type=client_credentials';
+
+    const options = {
+      hostname: EFI_SANDBOX ? 'pix-h.api.efipay.com.br' : 'pix.api.efipay.com.br',
+      path: '/oauth/token',
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${credentials}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+
+    // Certificado mTLS — necessário para Efí Bank em produção
+    // Em sandbox pode funcionar sem certificado
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.access_token) resolve(json.access_token);
+          else reject(new Error(json.error_description || 'Token não obtido'));
+        } catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Cria cobrança Pix imediata na Efí Bank
+async function criarCobrancaEfi(total, descricao, pedidoId) {
+  const token = await getEfiToken();
+
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      calendario: { expiracao: 3600 }, // 1 hora
+      valor: { original: Number(total).toFixed(2) },
+      chave: process.env.EFI_PIX_KEY || '', // sua chave Pix cadastrada na Efí
+      solicitacaoPagador: descricao.slice(0, 140),
+      infoAdicionais: [
+        { nome: 'Pedido', valor: pedidoId || 'N/A' }
+      ]
+    });
+
+    const options = {
+      hostname: EFI_SANDBOX ? 'pix-h.api.efipay.com.br' : 'pix.api.efipay.com.br',
+      path: '/v2/cob',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (res.statusCode === 201) resolve(json);
+          else reject(new Error(json.mensagem || JSON.stringify(json)));
+        } catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Gera QR Code para um txid
+async function gerarQRCode(txid) {
+  const token = await getEfiToken();
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: EFI_SANDBOX ? 'pix-h.api.efipay.com.br' : 'pix.api.efipay.com.br',
+      path: `/v2/loc/${txid}/qrcode`,
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// ── Rota de saúde
+app.get('/', (req, res) => res.json({ status: 'ok', servico: 'Hélo Gourmet Backend', gateway: 'Efí Bank' }));
+
+// ── Gerar QR Code Pix
+app.post('/criar-pix', async (req, res) => {
   try {
     const { itens, total } = req.body;
     if (!itens || itens.length === 0) {
       return res.status(400).json({ erro: 'Carrinho vazio.' });
     }
 
-    // Salva pedido no Firestore com status "pendente"
-    let pedidoId = null;
-    if (db) {
-      const ref = await db.collection('pedidos').add({
-        itens,
-        total,
-        status: 'pendente',
-        criadoEm: Timestamp.now()
-      });
-      pedidoId = ref.id;
-    }
-
-    // Cria preferência no Mercado Pago
-    const preference = new Preference(mp);
-    const resultado = await preference.create({
-      body: {
-        items: itens.map(item => ({
-          title: item.nome,
-          quantity: item.quantidade,
-          unit_price: Number(item.preco),
-          currency_id: 'BRL'
-        })),
-        back_urls: {
-          success: `${process.env.SITE_URL || 'https://cardapiohelogourmet.web.app'}/sucesso.html`,
-          failure: `${process.env.SITE_URL || 'https://cardapiohelogourmet.web.app'}/erro.html`,
-          pending: `${process.env.SITE_URL || 'https://cardapiohelogourmet.web.app'}/pendente.html`
-        },
-        auto_return: 'approved',
-        notification_url: `${process.env.BACKEND_URL || 'https://seu-backend.onrender.com'}/webhook`,
-        external_reference: pedidoId || 'sem-id',
-        statement_descriptor: 'HELO GOURMET'
-      }
-    });
-
-    res.json({
-      init_point: resultado.init_point,
-      sandbox_init_point: resultado.sandbox_init_point,
-      pedidoId
-    });
-
-  } catch (err) {
-    console.error('Erro ao criar pagamento:', err);
-    res.status(500).json({ erro: 'Erro ao criar pagamento.' });
-  }
-});
-
-// ── Gerar QR Code Pix (sem necessidade de conta MP do pagador)
-app.post('/criar-pix', async (req, res) => {
-  try {
-    const { itens, total, nomeCliente, emailCliente, cpfCliente } = req.body;
-    if (!itens || itens.length === 0) {
-      return res.status(400).json({ erro: 'Carrinho vazio.' });
-    }
-
     // Salva pedido no Firestore
-    let pedidoId = null;
+    let pedidoId = 'sem-id';
     if (db) {
       const ref = await db.collection('pedidos').add({
-        itens,
-        total,
+        itens, total,
         status: 'pendente',
         tipoPagamento: 'pix',
         criadoEm: Timestamp.now()
@@ -106,121 +162,94 @@ app.post('/criar-pix', async (req, res) => {
       pedidoId = ref.id;
     }
 
-    // Descrição resumida dos itens
-    const descricao = itens.map(i => `${i.quantidade}x ${i.nome}`).join(', ').slice(0, 200);
+    const descricao = itens.map(i => `${i.quantidade}x ${i.nome}`).join(', ');
 
-    // Cria pagamento Pix direto
-    const payment = new Payment(mp);
-    const resultado = await payment.create({
-      body: {
-        transaction_amount: Number(total),
-        description: descricao || 'Pedido Hélo Gourmet',
-        payment_method_id: 'pix',
-        payer: {
-          email: emailCliente || 'cliente@helogourmet.com.br',
-          first_name: nomeCliente || 'Cliente',
-          identification: cpfCliente
-            ? { type: 'CPF', number: cpfCliente.replace(/\D/g, '') }
-            : undefined
-        },
-        notification_url: `${process.env.BACKEND_URL || 'https://helogourmet-backend.onrender.com'}/webhook`,
-        external_reference: pedidoId || 'sem-id',
-        statement_descriptor: 'HELO GOURMET'
-      }
-    });
+    // Cria cobrança na Efí Bank
+    const cobranca = await criarCobrancaEfi(total, descricao, pedidoId);
+    const txid = cobranca.txid;
+    const locId = cobranca.loc?.id;
 
-    const pixData = resultado.point_of_interaction?.transaction_data;
+    // Gera QR Code
+    let qrCode = '', qrCodeBase64 = '';
+    if (locId) {
+      const qr = await gerarQRCode(locId);
+      qrCode = qr.qrcode || '';
+      qrCodeBase64 = qr.imagemQrcode?.replace('data:image/png;base64,', '') || '';
+    }
 
-    res.json({
-      pedidoId,
-      pagamentoId: resultado.id,
-      qrCode: pixData?.qr_code,           // código copia-e-cola
-      qrCodeBase64: pixData?.qr_code_base64, // imagem do QR Code
-      status: resultado.status,
-      expiracao: resultado.date_of_expiration
-    });
+    // Atualiza pedido com txid
+    if (db && pedidoId !== 'sem-id') {
+      await db.collection('pedidos').doc(pedidoId).update({ txid, locId });
+    }
+
+    res.json({ pedidoId, txid, qrCode, qrCodeBase64, status: cobranca.status });
 
   } catch (err) {
     console.error('Erro ao gerar Pix:', err?.message || err);
-    const detalhe = err?.cause?.message || err?.message || 'Erro desconhecido';
-    res.status(500).json({ erro: `Erro ao gerar Pix: ${detalhe}` });
+    res.status(500).json({ erro: `Erro ao gerar Pix: ${err?.message || 'Erro desconhecido'}` });
   }
 });
 
-// ── Verificar status de um pagamento Pix
-app.get('/status-pix/:pagamentoId', async (req, res) => {
+// ── Verificar status do Pix
+app.get('/status-pix/:txid', async (req, res) => {
   try {
-    const payment = new Payment(mp);
-    const resultado = await payment.get({ id: req.params.pagamentoId });
-    res.json({ status: resultado.status, statusDetalhe: resultado.status_detail });
+    const token = await getEfiToken();
+    const txid = req.params.txid;
+
+    const result = await new Promise((resolve, reject) => {
+      const options = {
+        hostname: EFI_SANDBOX ? 'pix-h.api.efipay.com.br' : 'pix.api.efipay.com.br',
+        path: `/v2/cob/${txid}`,
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${token}` }
+      };
+      const req = https.request(options, (r) => {
+        let data = '';
+        r.on('data', c => data += c);
+        r.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+      });
+      req.on('error', reject);
+      req.end();
+    });
+
+    // Status Efí: ATIVA, CONCLUIDA, REMOVIDA_PELO_USUARIO_RECEBEDOR, REMOVIDA_PELO_PSP
+    const pago = result.status === 'CONCLUIDA';
+    res.json({ status: pago ? 'approved' : 'pending', statusEfi: result.status });
+
   } catch (err) {
     res.status(500).json({ erro: 'Erro ao verificar status.' });
   }
 });
 
-// ── Webhook — Mercado Pago notifica aqui quando pagamento é confirmado
+// ── Webhook Efí Bank — notifica quando Pix é pago
 app.post('/webhook', async (req, res) => {
-  // Valida assinatura se a chave secreta estiver configurada
-  const secret = process.env.MP_WEBHOOK_SECRET;
-  if (secret) {
-    const xSignature = req.headers['x-signature'];
-    const xRequestId = req.headers['x-request-id'];
-    const dataId = req.query['data.id'] || req.body?.data?.id;
-
-    if (xSignature) {
-      const crypto = require('crypto');
-      const parts = xSignature.split(',');
-      let ts = '', v1 = '';
-      parts.forEach(p => {
-        const [k, v] = p.trim().split('=');
-        if (k === 'ts') ts = v;
-        if (k === 'v1') v1 = v;
-      });
-      const manifest = `id:${dataId};request-id:${xRequestId};ts:${ts};`;
-      const hmac = crypto.createHmac('sha256', secret).update(manifest).digest('hex');
-      if (hmac !== v1) {
-        console.warn('Webhook: assinatura inválida');
-        return res.sendStatus(401);
-      }
-    }
-  }
-
-  res.sendStatus(200); // Responde imediatamente
-
-  const { type, data } = req.body;
-  if (type !== 'payment' || !data?.id) return;
+  res.sendStatus(200);
 
   try {
-    // Busca detalhes do pagamento no MP
-    const payment = new Payment(mp);
-    const pagamento = await payment.get({ id: data.id });
+    const pixes = req.body?.pix || [];
+    for (const pix of pixes) {
+      const txid = pix.txid;
+      if (!txid || !db) continue;
 
-    const status = pagamento.status;           // approved, pending, rejected
-    const pedidoId = pagamento.external_reference;
-    const pagamentoId = String(pagamento.id);
+      // Busca pedido pelo txid
+      const snap = await db.collection('pedidos').where('txid', '==', txid).limit(1).get();
+      if (snap.empty) continue;
 
-    console.log(`Webhook recebido: pedido=${pedidoId} status=${status}`);
-
-    if (!db || !pedidoId || pedidoId === 'sem-id') return;
-
-    // Atualiza status do pedido no Firestore
-    const novoStatus = status === 'approved' ? 'pago'
-                     : status === 'rejected' ? 'cancelado'
-                     : 'pendente';
-
-    await db.collection('pedidos').doc(pedidoId).update({
-      status: novoStatus,
-      pagamentoId,
-      pagamentoStatus: status,
-      atualizadoEm: Timestamp.now()
-    });
-
-    console.log(`Pedido ${pedidoId} atualizado para: ${novoStatus}`);
-
+      const pedidoDoc = snap.docs[0];
+      await pedidoDoc.ref.update({
+        status: 'pago',
+        pagamentoId: pix.endToEndId || txid,
+        atualizadoEm: Timestamp.now()
+      });
+      console.log(`Pix confirmado: pedido=${pedidoDoc.id} txid=${txid}`);
+    }
   } catch (err) {
-    console.error('Erro no webhook:', err);
+    console.error('Erro no webhook Efí:', err);
   }
 });
+
+// ── Webhook Efí requer validação de chave (GET)
+app.get('/webhook', (req, res) => res.sendStatus(200));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));

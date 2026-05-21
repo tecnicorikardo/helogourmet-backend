@@ -1,11 +1,9 @@
 // ============================================================
 // BACKEND — Pix via Efí Bank + Webhook
-// Deploy no Render.com
 // ============================================================
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
-const fs = require('fs');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore, Timestamp } = require('firebase-admin/firestore');
 
@@ -27,229 +25,166 @@ try {
 // ── Efí Bank config
 const EFI_CLIENT_ID     = process.env.EFI_CLIENT_ID     || '';
 const EFI_CLIENT_SECRET = process.env.EFI_CLIENT_SECRET || '';
-const EFI_SANDBOX       = process.env.EFI_SANDBOX === 'true'; // false em produção
-const EFI_BASE_URL      = EFI_SANDBOX
-  ? 'https://pix-h.api.efipay.com.br'
-  : 'https://pix.api.efipay.com.br';
+const EFI_SANDBOX       = process.env.EFI_SANDBOX === 'true';
+const EFI_BASE_HOST     = EFI_SANDBOX ? 'pix-h.api.efipay.com.br' : 'pix.api.efipay.com.br';
 
-console.log(`Efí Bank: ${EFI_SANDBOX ? 'SANDBOX' : 'PRODUÇÃO'}`);
-console.log(`Client ID configurado: ${EFI_CLIENT_ID ? EFI_CLIENT_ID.slice(0,12) + '...' : 'NÃO CONFIGURADO'}`);
+console.log(`Efí Bank: ${EFI_SANDBOX ? 'SANDBOX' : 'PRODUCAO'} | ${EFI_BASE_HOST}`);
+console.log(`Client ID: ${EFI_CLIENT_ID ? EFI_CLIENT_ID.slice(0,15) + '...' : 'NAO CONFIGURADO'}`);
 
-// ── Obtém token de acesso da Efí Bank
-async function getEfiToken() {
+// ── Certificado mTLS (base64 → buffer)
+let efiCert = null;
+if (process.env.EFI_CERT_BASE64) {
+  efiCert = Buffer.from(process.env.EFI_CERT_BASE64, 'base64');
+  console.log(`Certificado: ${efiCert.length} bytes`);
+} else {
+  console.warn('EFI_CERT_BASE64 nao configurado');
+}
+
+// ── Agent HTTPS com certificado
+function makeAgent() {
+  const opts = { rejectUnauthorized: false };
+  if (efiCert) { opts.pfx = efiCert; opts.passphrase = ''; }
+  return new https.Agent(opts);
+}
+
+// ── Requisição genérica para Efí Bank
+function efiReq(method, path, token, body) {
   return new Promise((resolve, reject) => {
-    const credentials = Buffer.from(`${EFI_CLIENT_ID}:${EFI_CLIENT_SECRET}`).toString('base64');
-    const body = 'grant_type=client_credentials';
+    const bodyStr = body ? JSON.stringify(body) : null;
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (bodyStr) headers['Content-Length'] = Buffer.byteLength(bodyStr);
+    const opts = { hostname: EFI_BASE_HOST, path, method, headers, agent: makeAgent() };
+    const req = https.request(opts, (res) => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(d) }); }
+        catch(e) { resolve({ status: res.statusCode, body: d }); }
+      });
+    });
+    req.on('error', reject);
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
 
-    const options = {
-      hostname: EFI_SANDBOX ? 'pix-h.api.efipay.com.br' : 'pix.api.efipay.com.br',
-      path: '/oauth/token',
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${credentials}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body)
-      }
+// ── Obtém token OAuth
+async function getToken() {
+  const creds = Buffer.from(`${EFI_CLIENT_ID}:${EFI_CLIENT_SECRET}`).toString('base64');
+  const body = JSON.stringify({ grant_type: 'client_credentials' });
+  return new Promise((resolve, reject) => {
+    const headers = {
+      'Authorization': `Basic ${creds}`,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
     };
-
-    // Certificado mTLS — necessário para Efí Bank em produção
-    // Em sandbox pode funcionar sem certificado
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
+    const opts = { hostname: EFI_BASE_HOST, path: '/oauth/token', method: 'POST', headers, agent: makeAgent() };
+    const req = https.request(opts, (res) => {
+      let d = '';
+      res.on('data', c => d += c);
       res.on('end', () => {
         try {
-          const json = JSON.parse(data);
+          const json = JSON.parse(d);
           if (json.access_token) resolve(json.access_token);
-          else reject(new Error(json.error_description || 'Token não obtido'));
+          else reject(new Error(json.error_description || JSON.stringify(json)));
         } catch(e) { reject(e); }
       });
     });
     req.on('error', reject);
     req.write(body);
-    req.end();
-  });
-}
-
-// ── Cria cobrança Pix imediata na Efí Bank
-async function criarCobrancaEfi(total, descricao, pedidoId) {
-  const token = await getEfiToken();
-
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      calendario: { expiracao: 3600 }, // 1 hora
-      valor: { original: Number(total).toFixed(2) },
-      chave: process.env.EFI_PIX_KEY || '', // sua chave Pix cadastrada na Efí
-      solicitacaoPagador: descricao.slice(0, 140),
-      infoAdicionais: [
-        { nome: 'Pedido', valor: pedidoId || 'N/A' }
-      ]
-    });
-
-    const options = {
-      hostname: EFI_SANDBOX ? 'pix-h.api.efipay.com.br' : 'pix.api.efipay.com.br',
-      path: '/v2/cob',
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body)
-      }
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          if (res.statusCode === 201) resolve(json);
-          else reject(new Error(json.mensagem || JSON.stringify(json)));
-        } catch(e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-// ── Gera QR Code para um txid
-async function gerarQRCode(txid) {
-  const token = await getEfiToken();
-
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: EFI_SANDBOX ? 'pix-h.api.efipay.com.br' : 'pix.api.efipay.com.br',
-      path: `/v2/loc/${txid}/qrcode`,
-      method: 'GET',
-      headers: { 'Authorization': `Bearer ${token}` }
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
     req.end();
   });
 }
 
 // ── Rota de saúde
-app.get('/', (req, res) => res.json({ status: 'ok', servico: 'Hélo Gourmet Backend', gateway: 'Efí Bank' }));
+app.get('/', (req, res) => res.json({ status: 'ok', servico: 'Helo Gourmet Backend', gateway: 'Efi Bank' }));
 
 // ── Gerar QR Code Pix
 app.post('/criar-pix', async (req, res) => {
   try {
     const { itens, total } = req.body;
-    if (!itens || itens.length === 0) {
-      return res.status(400).json({ erro: 'Carrinho vazio.' });
-    }
+    if (!itens || itens.length === 0) return res.status(400).json({ erro: 'Carrinho vazio.' });
 
-    // Salva pedido no Firestore
     let pedidoId = 'sem-id';
     if (db) {
       const ref = await db.collection('pedidos').add({
-        itens, total,
-        status: 'pendente',
-        tipoPagamento: 'pix',
-        criadoEm: Timestamp.now()
+        itens, total, status: 'pendente', tipoPagamento: 'pix', criadoEm: Timestamp.now()
       });
       pedidoId = ref.id;
     }
 
     const descricao = itens.map(i => `${i.quantidade}x ${i.nome}`).join(', ');
+    const token = await getToken();
 
-    // Cria cobrança na Efí Bank
-    const cobranca = await criarCobrancaEfi(total, descricao, pedidoId);
-    const txid = cobranca.txid;
-    const locId = cobranca.loc?.id;
+    // Cria cobrança
+    const cobBody = {
+      calendario: { expiracao: 3600 },
+      valor: { original: Number(total).toFixed(2) },
+      chave: process.env.EFI_PIX_KEY || '',
+      solicitacaoPagador: descricao.slice(0, 140),
+      infoAdicionais: [{ nome: 'Pedido', valor: pedidoId }]
+    };
+    const cob = await efiReq('POST', '/v2/cob', token, cobBody);
+    if (cob.status !== 201) throw new Error(cob.body?.mensagem || JSON.stringify(cob.body));
+
+    const txid = cob.body.txid;
+    const locId = cob.body.loc?.id;
 
     // Gera QR Code
     let qrCode = '', qrCodeBase64 = '';
     if (locId) {
-      const qr = await gerarQRCode(locId);
-      qrCode = qr.qrcode || '';
-      qrCodeBase64 = qr.imagemQrcode?.replace('data:image/png;base64,', '') || '';
+      const qr = await efiReq('GET', `/v2/loc/${locId}/qrcode`, token);
+      qrCode = qr.body.qrcode || '';
+      qrCodeBase64 = (qr.body.imagemQrcode || '').replace('data:image/png;base64,', '');
     }
 
-    // Atualiza pedido com txid
     if (db && pedidoId !== 'sem-id') {
       await db.collection('pedidos').doc(pedidoId).update({ txid, locId });
     }
 
-    res.json({ pedidoId, txid, qrCode, qrCodeBase64, status: cobranca.status });
+    res.json({ pedidoId, txid, qrCode, qrCodeBase64, status: cob.body.status });
 
   } catch (err) {
-    console.error('Erro ao gerar Pix:', err?.message || err);
+    console.error('Erro Pix:', err?.message || err);
     res.status(500).json({ erro: `Erro ao gerar Pix: ${err?.message || 'Erro desconhecido'}` });
   }
 });
 
-// ── Verificar status do Pix
+// ── Verificar status
 app.get('/status-pix/:txid', async (req, res) => {
   try {
-    const token = await getEfiToken();
-    const txid = req.params.txid;
-
-    const result = await new Promise((resolve, reject) => {
-      const options = {
-        hostname: EFI_SANDBOX ? 'pix-h.api.efipay.com.br' : 'pix.api.efipay.com.br',
-        path: `/v2/cob/${txid}`,
-        method: 'GET',
-        headers: { 'Authorization': `Bearer ${token}` }
-      };
-      const req = https.request(options, (r) => {
-        let data = '';
-        r.on('data', c => data += c);
-        r.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
-      });
-      req.on('error', reject);
-      req.end();
-    });
-
-    // Status Efí: ATIVA, CONCLUIDA, REMOVIDA_PELO_USUARIO_RECEBEDOR, REMOVIDA_PELO_PSP
-    const pago = result.status === 'CONCLUIDA';
-    res.json({ status: pago ? 'approved' : 'pending', statusEfi: result.status });
-
+    const token = await getToken();
+    const r = await efiReq('GET', `/v2/cob/${req.params.txid}`, token);
+    res.json({ status: r.body.status === 'CONCLUIDA' ? 'approved' : 'pending', statusEfi: r.body.status });
   } catch (err) {
     res.status(500).json({ erro: 'Erro ao verificar status.' });
   }
 });
 
-// ── Webhook Efí Bank — notifica quando Pix é pago
+// ── Webhook Efí (GET para validação)
+app.get('/webhook', (req, res) => res.sendStatus(200));
+
+// ── Webhook Efí (POST — pagamento confirmado)
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
-
   try {
     const pixes = req.body?.pix || [];
     for (const pix of pixes) {
-      const txid = pix.txid;
-      if (!txid || !db) continue;
-
-      // Busca pedido pelo txid
-      const snap = await db.collection('pedidos').where('txid', '==', txid).limit(1).get();
+      if (!pix.txid || !db) continue;
+      const snap = await db.collection('pedidos').where('txid', '==', pix.txid).limit(1).get();
       if (snap.empty) continue;
-
-      const pedidoDoc = snap.docs[0];
-      await pedidoDoc.ref.update({
+      await snap.docs[0].ref.update({
         status: 'pago',
-        pagamentoId: pix.endToEndId || txid,
+        pagamentoId: pix.endToEndId || pix.txid,
         atualizadoEm: Timestamp.now()
       });
-      console.log(`Pix confirmado: pedido=${pedidoDoc.id} txid=${txid}`);
+      console.log(`Pix pago: ${pix.txid}`);
     }
   } catch (err) {
-    console.error('Erro no webhook Efí:', err);
+    console.error('Erro webhook:', err);
   }
 });
 
-// ── Webhook Efí requer validação de chave (GET)
-app.get('/webhook', (req, res) => res.sendStatus(200));
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor na porta ${PORT}`));
